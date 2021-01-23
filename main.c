@@ -19,7 +19,8 @@ enum client_state {HANDSHAKE, FORWARD};
 
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct client {
-	int fd;
+	int client_fd;
+	int server_fd;
 	enum client_state state;
 	unsigned char *buff;
 	size_t used_buff;
@@ -50,7 +51,7 @@ int init_client(int sockfd) {
 		return -1;
 	}
 
-	clients[cid].fd = sockfd;
+	clients[cid].client_fd = sockfd;
 	clients[cid].state = HANDSHAKE;
 	clients[cid].used_buff = 0;
 
@@ -58,9 +59,14 @@ int init_client(int sockfd) {
 }
 
 void close_client(int cid) {
-	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, clients[cid].fd, NULL);
-	close(clients[cid].fd);
+	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, clients[cid].client_fd, NULL);
+	close(clients[cid].client_fd);
 	free(clients[cid].buff);
+
+	if(clients[cid].state == FORWARD) {
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, clients[cid].server_fd, NULL);
+		close(clients[cid].server_fd);
+	}
 
 	// delete client, fill the hole with the last client
 	clients[cid] = clients[client_count - 1];
@@ -170,7 +176,6 @@ struct mcpacket_hdr parse_hdr(unsigned char *buf, size_t len, int *bytes_used) {
 
 	// packet length, as in minectaft protocol - len of packetid + data
 	int plen = read_VarInt(buf + head, len - head, &used);
-	printf("parse_hdr, used=%d\n", used);
 	if(used == -1) { // more data needed
 		*bytes_used = 0;
 		return packet;
@@ -212,12 +217,12 @@ struct mcpacket_hdr parse_hdr(unsigned char *buf, size_t len, int *bytes_used) {
 	return packet;
 }
 
-void handle(int cid) {
-	int res = recv(clients[cid].fd, clients[cid].buff + clients[cid].used_buff, MAX_BUF_SIZE - clients[cid].used_buff, 0);
+void handle_c2s(int cid) {
+	int res = recv(clients[cid].client_fd, clients[cid].buff + clients[cid].used_buff, MAX_BUF_SIZE - clients[cid].used_buff, 0);
 	//printf("recv %d new bytes\n", res);
 
 	if(res == 0) { // socket closed
-		printf("closing client %d with sockfd %d!\n", cid, clients[cid].fd);
+		printf("closing client %d with sockfd %d!\n", cid, clients[cid].client_fd);
 		close_client(cid);
 		return;
 	}
@@ -228,7 +233,20 @@ void handle(int cid) {
 	clients[cid].used_buff += res;
 
 	if(clients[cid].state == FORWARD) {
-		// TODO simply forward the data to the real server
+		printf("FORWARD\n");
+		int send_cnt = write(clients[cid].server_fd, clients[cid].buff, clients[cid].used_buff);
+		if(send_cnt < 0) {
+			perror("Could not send data to server");
+			close_client(cid);
+			return;
+		}
+		printf("sendcnt=%d\n", send_cnt);
+		clients[cid].used_buff -= send_cnt;
+		if(clients[cid].used_buff != 0) {
+			perror("I have no clue how to handle this :<");
+			close_client(cid);
+		}
+		printf("END FORWARD\n");
 		return;
 	}
 
@@ -251,11 +269,6 @@ void handle(int cid) {
 		puts("parse_hdr needs more data");
 		return;
 	}
-	printf(" pid=%d payloadlen=%ld bytes_used=%d\n", hdr.packetid, hdr.payloadlen, bytes_used);
-
-	// remove packet from client buffer
-	memcpy(clients[cid].buff, clients[cid].buff + bytes_used, bytes_used);
-	clients[cid].used_buff -= bytes_used;
 
 	/*
 	printf(" payload=");
@@ -288,11 +301,74 @@ void handle(int cid) {
 	}
 	printf("\n");
 
+	/*
+	// remove packet from client buffer
+	memcpy(clients[cid].buff, clients[cid].buff + bytes_used, bytes_used);
+	clients[cid].used_buff -= bytes_used;
+	*/
+
+	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if(server_fd < 0) {
+		perror("Could not create new socket to forward data to. Closing client");
+		close_client(cid);
+		goto end;
+	}
+
+	clients[cid].state = FORWARD;
+	clients[cid].server_fd = server_fd;
+
+	if(fcntl(server_fd, F_SETFL, O_NONBLOCK) < 0) {
+		perror("Could not set O_NONBLOCK to server_fd socket");
+		close_client(cid);
+		goto end;
+	}
+
+	struct sockaddr_in server;
+	server.sin_addr.s_addr = inet_addr("127.0.0.1");
+	server.sin_family = AF_INET;
+	server.sin_port = htons(2001);
+	if(connect(server_fd, (struct sockaddr *)&server, sizeof(server)) < 0 && errno != EINPROGRESS) {
+		perror("Could not connect socket to server. Closing client");
+		close_client(cid);
+		goto end;
+	}
+
+	struct epoll_event event;
+	event.events = EPOLLIN;
+	event.data.fd = server_fd;
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event)) {
+		perror("epoll_ctl failed to add server_fd");
+		close_client(cid);
+		goto end;
+	}
+
+
+	int send_cnt = write(clients[cid].server_fd, clients[cid].buff, clients[cid].used_buff);
+	if(send_cnt < 0) {
+		perror("Could not send data to server");
+		close_client(cid);
+		goto end;
+	}
+	printf("sendcnt=%d\n", send_cnt);
+	clients[cid].used_buff -= send_cnt;
+	if(clients[cid].used_buff != 0) {
+		perror("I have no clue how to handle this :<");
+		close_client(cid);
+	}
+
+end:
 	free(packet.server_address);
 	free(hdr.payload);
-	// TODO set state forward
+}
 
-	//puts("handle done");
+void handle_s2c(int cid) {
+	char c;
+	if(read(clients[cid].server_fd, &c, 1) < 0) return;
+	if(write(clients[cid].client_fd, &c, 1) < 0) {
+		close_client(cid);
+		perror("");
+		return;
+	}
 }
 
 void *accept_connections() {
@@ -311,10 +387,11 @@ void *accept_connections() {
 
 		pthread_mutex_lock(&clients_mutex);
 
-		printf("Adding client: %d\n", new_socket);
 		int cid = init_client(new_socket);
+		printf("Adding client: %d (fd=%d)\n", cid, new_socket);
 		if(cid < 0) {
 			close(new_socket);
+			client_count --;
 		} else {
 			struct epoll_event event;
 			event.events = EPOLLIN;
@@ -329,9 +406,16 @@ void *accept_connections() {
 	}
 }
 
-int get_client_id_by_sockfd(int sockfd) {
+int get_client_id_by_clientfd(int sockfd) {
 	for(int i = 0;i < client_count;i ++) {
-		if(clients[i].fd == sockfd) return i;
+		if(clients[i].client_fd == sockfd) return i;
+	}
+	return -1;
+}
+
+int get_client_id_by_serverfd(int sockfd) {
+	for(int i = 0;i < client_count;i ++) {
+		if(clients[i].server_fd == sockfd) return i;
 	}
 	return -1;
 }
@@ -369,12 +453,30 @@ int main(int argc , char *argv[])
 		pthread_mutex_lock(&clients_mutex);
 		for(int i = 0;i < event_count;i ++) {
 			int fd = events[i].data.fd;
-			puts("==============");
+			//puts("============== NEW EPOLL EVENT ================");
+			int client_id;
+
+			client_id = get_client_id_by_clientfd(fd);
+			if(client_id != -1) {
+				printf("handle_c2s(%d)\n", client_id);
+				handle_c2s(client_id);
+				continue;
+			}
+
+			client_id = get_client_id_by_serverfd(fd);
+			if(client_id != -1) {
+				//printf("handle_s2c(%d)\n", client_id);
+				handle_s2c(client_id);
+				continue;
+			}
+
+			printf("CRITICAL: Received event for fd that could not be found in clients\n");
 			//printf("Got event for fd: %d\n", fd);
-			handle(get_client_id_by_sockfd(fd));
 		}
 		pthread_mutex_unlock(&clients_mutex);
 	}
+
+	puts("WTF");
 
 	return 0;
 }
