@@ -1,7 +1,8 @@
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+
 #include <fcntl.h>
 #include <errno.h>
 
@@ -11,60 +12,78 @@
 #include <sys/epoll.h>
 #include <pthread.h>
 
-int listen_sock_fd;
+#include "minecraft.h"
+
 int epoll_fd;
 
-const size_t MAX_BUF_SIZE = 1000;
 enum client_state {HANDSHAKE, FORWARD};
 
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+const size_t MAX_BUF_SIZE = 10240;
+struct buffer {
+	unsigned char *data;
+	size_t len;
+};
+
 struct client {
 	int client_fd;
 	int server_fd;
+
 	enum client_state state;
-	unsigned char *buff;
-	size_t used_buff;
+
+	struct buffer c2sbuf, s2cbuf;
 } clients[100];
 int client_count = 0;
 
-struct mcpacket_hdr {
-	int packetid;
-	size_t payloadlen;
-	unsigned char *payload;
-};
+void mod_epoll(int fd, int events) {
+	struct epoll_event ev;
+	ev.data.fd = fd;
+	ev.events = events;
+	epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+}
 
-struct mcpacket_handshake {
-	int protocol_version;
-	int server_address_len;
-	unsigned char *server_address;
-	int server_port;
-	int next_state;
-};
+int init_buff(struct buffer *buf) {
+	buf->data = malloc(MAX_BUF_SIZE);
+	if(buf->data == NULL) return -1;
+	buf->len = 0;
+	return 0;
+}
 
 int init_client(int sockfd) {
 	const size_t cid = client_count ++;
-	clients[cid].buff = malloc(MAX_BUF_SIZE);
 
-	if(clients[cid].buff == NULL) {
-		perror("Failed to allocate buffer for new client.");
+	if(init_buff(&clients[cid].c2sbuf) < 0) {
+		perror("init_client: Failed to allocate buffer for new client");
+		client_count --;
+		return -1;
+	}
+
+	if(init_buff(&clients[cid].s2cbuf) < 0) {
+		perror("init_client: Failed to allocate buffer for new client");
+		client_count --;
+		return -1;
+	}
+
+	struct epoll_event event;
+	event.events = EPOLLIN;
+	event.data.fd = sockfd;
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &event)) {
+		perror("init_client: epoll_ctl failed");
 		client_count --;
 		return -1;
 	}
 
 	clients[cid].client_fd = sockfd;
 	clients[cid].state = HANDSHAKE;
-	clients[cid].used_buff = 0;
 
 	return cid;
 }
 
 void close_client(int cid) {
-	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, clients[cid].client_fd, NULL);
-	close(clients[cid].client_fd);
-	free(clients[cid].buff);
+	free(clients[cid].c2sbuf.data);
+	free(clients[cid].s2cbuf.data);
 
+	close(clients[cid].client_fd);
 	if(clients[cid].state == FORWARD) {
-		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, clients[cid].server_fd, NULL);
 		close(clients[cid].server_fd);
 	}
 
@@ -76,7 +95,7 @@ void close_client(int cid) {
 int start_listening(int port) {
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd == -1) {
-		puts("Could not create socket");
+		perror("Could not create socket");
 		return 1;
 	}
 
@@ -94,171 +113,75 @@ int start_listening(int port) {
 		return -1;
 	}
 
-	puts("Bind done");
+	if(listen(sockfd, 5) == -1) {
+		perror("listen failed");
+		return 1;
+	}
 
 	return sockfd;
 }
 
-int read_VarInt(unsigned char *buf, size_t len, int *used) {
-	int numRead = 0;
-	int result = 0;
-	unsigned char read;
-	do {
-		if(numRead == len) {
-			*used = -1;
+int drain(int fd, struct buffer *buf) {
+	// TODO write in a while() until no data left or EAGAIN for better performance?
+
+	if(buf->len == 0) {
+		printf("BUG?: drain() got an empty buffer\n");
+		mod_epoll(fd, EPOLLIN);
+		return 0;
+	}
+
+	int res = send(fd, buf->data, buf->len, MSG_NOSIGNAL);
+	//printf("drain: res=%d\n", res);
+
+	if(res == -1) {
+		if(errno == EAGAIN || errno == EWOULDBLOCK) {
+			mod_epoll(fd, EPOLLIN | EPOLLOUT);
 			return 0;
 		}
-		read = buf[numRead];
-		int value = (read & 0b01111111);
-		result |= (value << (7 * numRead));
+		return -1;
+	}
 
-		numRead++;
-		if (numRead > 5) {
-			*used = -2;
-			return 0;
-		}
-	} while ((read & 0b10000000) != 0);
+	buf->len -= res;
+	if(buf->len == 0) {
+		mod_epoll(fd, EPOLLIN);
+		return 0;
+	}
 
-	*used = numRead;
-	return result;
+	if(res == 0) {
+		mod_epoll(fd, EPOLLIN | EPOLLOUT);
+		return 0;
+	}
+
+	mod_epoll(fd, EPOLLIN | EPOLLOUT);
+	memcpy(buf->data, buf->data + res, buf->len);
+	return 0;
 }
 
-struct mcpacket_handshake parse_handshake(unsigned char *buf, size_t len, char *status) {
-	struct mcpacket_handshake packet;
-
-	int head = 0;
-	int used = 0;
-
-	packet.protocol_version = read_VarInt(buf + head, len - head, &used);
-	if(used < 0) { *status = -1; return packet; }
-	head += used;
-
-
-	packet.server_address_len = read_VarInt(buf + head, len - head, &used);
-	if(used < 0) { *status = -1; return packet; }
-	head += used;
-
-
-	if(packet.server_address_len > 255*4+3)    { *status = -1; return packet; }
-	if(head + packet.server_address_len > len) { *status = -1; return packet; }
-	packet.server_address = malloc(packet.server_address_len);
-	if(packet.server_address == NULL)          { *status = -1; return packet; }
-	memcpy(packet.server_address, buf + head, packet.server_address_len);
-	head += packet.server_address_len;
-
-
-	// server port - unsigned short, ignoring it
-	if(head + 2 > len) {
-		free(packet.server_address);
-		*status = -1;
-		return packet;
-	}
-	head += 2;
-
-
-	packet.next_state = read_VarInt(buf + head, len - head, &used);
-	if(used < 0) {
-		free(packet.server_address);
-		*status = -1;
-		return packet;
-	}
-
-
-	*status = 0;
-	return packet;
-}
-
-struct mcpacket_hdr parse_hdr(unsigned char *buf, size_t len, int *bytes_used) {
-	struct mcpacket_hdr packet;
-
-	int head = 0;
-	int used = 0;
-
-	// packet length, as in minectaft protocol - len of packetid + data
-	int plen = read_VarInt(buf + head, len - head, &used);
-	if(used == -1) { // more data needed
-		*bytes_used = 0;
-		return packet;
-	}
-	if(used == -2) { // error reading plen
-		*bytes_used = -1;
-		return packet;
-	}
-	head += used;
-
-	packet.packetid = read_VarInt(buf + head, len - head, &used);
-	if(used == -1) { // more data needed
-		*bytes_used = 0;
-		return packet;
-	}
-	if(used == -2) { // error reading packetid
-		*bytes_used = -1;
-		return packet;
-	}
-	head += used;
-
-	if(plen-used < 0) {
-		*bytes_used = -1;
-		return packet;
-	}
-
-	// payload = minecraft protocol "data"
-	packet.payloadlen = plen-used;
-	//printf("payloadlen=%d, head=%d, plen=%d, used=%d, len=%ld\n", packet.payloadlen, head, plen, used, len);
-	if(head + packet.payloadlen > len) {
-		*bytes_used = 0; // need more data
-		return packet;
-	}
-
-	*bytes_used = head + packet.payloadlen;
-	packet.payload = malloc(packet.payloadlen); // TODO error checking
-	memcpy(packet.payload, buf + head, packet.payloadlen);
-
-	return packet;
-}
-
-void handle_c2s(int cid) {
-	int res = recv(clients[cid].client_fd, clients[cid].buff + clients[cid].used_buff, MAX_BUF_SIZE - clients[cid].used_buff, 0);
-	//printf("recv %d new bytes\n", res);
-
-	if(res == 0) { // socket closed
-		printf("closing client %d with sockfd %d!\n", cid, clients[cid].client_fd);
+void drain_c2s(int cid) {
+	if(drain(clients[cid].server_fd, &clients[cid].c2sbuf) < 0) {
 		close_client(cid);
-		return;
 	}
+}
 
-	if(res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) return; // no data left
-
-	// data was received successfully
-	clients[cid].used_buff += res;
-
-	if(clients[cid].state == FORWARD) {
-		printf("FORWARD\n");
-		int send_cnt = write(clients[cid].server_fd, clients[cid].buff, clients[cid].used_buff);
-		if(send_cnt < 0) {
-			perror("Could not send data to server");
-			close_client(cid);
-			return;
-		}
-		printf("sendcnt=%d\n", send_cnt);
-		clients[cid].used_buff -= send_cnt;
-		if(clients[cid].used_buff != 0) {
-			perror("I have no clue how to handle this :<");
-			close_client(cid);
-		}
-		printf("END FORWARD\n");
-		return;
+void drain_s2c(int cid) {
+	if(drain(clients[cid].client_fd, &clients[cid].s2cbuf) < 0) {
+		close_client(cid);
 	}
+}
 
-	printf("Current bytes (%ld):\n", clients[cid].used_buff);
-	for(size_t i = 0;i < clients[cid].used_buff;i ++) {
-		printf("%.02x ", clients[cid].buff[i]);
+void handshake(int cid) {
+	//printf("handshake(%d)\n", cid);
+
+	/*
+	printf("Current bytes (%ld):\n", clients[cid].c2sbuf.len);
+	for(size_t i = 0;i < clients[cid].c2sbuf.len;i ++) {
+		printf("%.02x ", clients[cid].c2sbuf.data[i]);
 	}
 	puts("");
+	*/
 
 	int bytes_used;
-	struct mcpacket_hdr hdr = parse_hdr(clients[cid].buff, clients[cid].used_buff, &bytes_used);
-	//printf(" pid=%d payloadlen=%ld bytes_used=%d\n", hdr.packetid, hdr.payloadlen, bytes_used);
+	struct mcpacket_hdr hdr = parse_hdr(clients[cid].c2sbuf.data, clients[cid].c2sbuf.len, &bytes_used);
 
 	if(bytes_used < 0) { // critical error
 		printf("parse_hdr reported critical error! Closing client\n");
@@ -269,6 +192,7 @@ void handle_c2s(int cid) {
 		puts("parse_hdr needs more data");
 		return;
 	}
+	//printf(" pid=%d payloadlen=%ld bytes_used=%d\n", hdr.packetid, hdr.payloadlen, bytes_used);
 
 	/*
 	printf(" payload=");
@@ -287,31 +211,27 @@ void handle_c2s(int cid) {
 
 	char status = 0;
 	struct mcpacket_handshake packet = parse_handshake(hdr.payload, hdr.payloadlen, &status);
+	free(hdr.payload);
+
 	if(status < 0) {
 		printf("parse_handshake reported critical error! Closing client\n");
-		free(hdr.payload);
 		close_client(cid);
 		return;
 	}
 
-	printf("NEW FORWARD: ver=%d, next_state=%d, hlen=%d hostname=",
-			packet.protocol_version, packet.next_state, packet.server_address_len);
+	printf("NEW FORWARD: ver=%d, next_state=%d, hostname=",
+			packet.protocol_version, packet.next_state);
 	for(int i = 0;i < packet.server_address_len;i ++) {
 		printf("%c", packet.server_address[i]);
 	}
 	printf("\n");
 
-	/*
-	// remove packet from client buffer
-	memcpy(clients[cid].buff, clients[cid].buff + bytes_used, bytes_used);
-	clients[cid].used_buff -= bytes_used;
-	*/
-
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(server_fd < 0) {
 		perror("Could not create new socket to forward data to. Closing client");
 		close_client(cid);
-		goto end;
+		free(packet.server_address);
+		return;
 	}
 
 	clients[cid].state = FORWARD;
@@ -320,90 +240,137 @@ void handle_c2s(int cid) {
 	if(fcntl(server_fd, F_SETFL, O_NONBLOCK) < 0) {
 		perror("Could not set O_NONBLOCK to server_fd socket");
 		close_client(cid);
-		goto end;
+		free(packet.server_address);
+		return;
 	}
 
 	struct sockaddr_in server;
 	server.sin_addr.s_addr = inet_addr("127.0.0.1");
 	server.sin_family = AF_INET;
 	server.sin_port = htons(2001);
+	free(packet.server_address);
+
 	if(connect(server_fd, (struct sockaddr *)&server, sizeof(server)) < 0 && errno != EINPROGRESS) {
 		perror("Could not connect socket to server. Closing client");
 		close_client(cid);
-		goto end;
+		return;
 	}
 
-	struct epoll_event event;
-	event.events = EPOLLIN;
-	event.data.fd = server_fd;
-	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event)) {
-		perror("epoll_ctl failed to add server_fd");
+	struct epoll_event ev;
+	ev.data.fd = server_fd;
+	ev.events = EPOLLIN;
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev)) {
+		perror("handshake: epoll_ctl failed");
 		close_client(cid);
-		goto end;
+		return;
 	}
 
+	drain_c2s(cid);
+}
 
-	int send_cnt = write(clients[cid].server_fd, clients[cid].buff, clients[cid].used_buff);
-	if(send_cnt < 0) {
-		perror("Could not send data to server");
+void handle_c2s(int cid) {
+	//printf("handle_c2s(%d)\n", cid);
+	int res = recv(clients[cid].client_fd,
+			clients[cid].c2sbuf.data + clients[cid].c2sbuf.len,
+			MAX_BUF_SIZE - clients[cid].c2sbuf.len, 0);
+
+	if(res == 0) { // socket closed?
+		int error = 0;
+		socklen_t len = sizeof(error);
+
+		if(getsockopt(clients[cid].server_fd, SOL_SOCKET, SO_ERROR, &error, &len)) {
+			perror("handle_c2s: getsockopt failed:");
+			close_client(cid);
+			return;
+		}
+
+		// TODO why are we getting res=0 if the socket is not closed?
+		if(error == 0) { // ok, socket was not closed, for some reason we had 0 bytes to read
+			return;
+		}
+
+		printf("handle_c2s: closing client %d with sockfd %d!\n", cid, clients[cid].client_fd);
 		close_client(cid);
-		goto end;
-	}
-	printf("sendcnt=%d\n", send_cnt);
-	clients[cid].used_buff -= send_cnt;
-	if(clients[cid].used_buff != 0) {
-		perror("I have no clue how to handle this :<");
-		close_client(cid);
+		return;
 	}
 
-end:
-	free(packet.server_address);
-	free(hdr.payload);
+	if(res == -1) {
+		if(errno == EAGAIN || errno == EWOULDBLOCK) return; // no data left
+		perror("handle_c2s(): Could not read");
+		close_client(cid);
+		return;
+	}
+
+	// data was received successfully
+	clients[cid].c2sbuf.len += res;
+
+	if(clients[cid].state == FORWARD) {
+		drain_c2s(cid);
+	} else {
+		handshake(cid);
+	}
 }
 
 void handle_s2c(int cid) {
-	char c;
-	if(read(clients[cid].server_fd, &c, 1) < 0) return;
-	if(write(clients[cid].client_fd, &c, 1) < 0) {
+	int res = recv(clients[cid].server_fd,
+			clients[cid].s2cbuf.data + clients[cid].s2cbuf.len,
+			MAX_BUF_SIZE - clients[cid].s2cbuf.len, 0);
+
+	if(res == 0) { // socket closed?
+		int error = 0;
+		socklen_t len = sizeof(error);
+
+		if(getsockopt(clients[cid].server_fd, SOL_SOCKET, SO_ERROR, &error, &len)) {
+			perror("handle_s2c: getsockopt failed:");
+			close_client(cid);
+			return;
+		}
+
+		// TODO why are we getting res=0 if the socket is not closed?
+		if(error == 0) { // ok, socket was not closed, for some reason we had 0 bytes to read
+			return;
+		}
+
+		printf("handle_s2c: closing client %d with sockfd %d!\n", cid, clients[cid].client_fd);
 		close_client(cid);
-		perror("");
 		return;
 	}
+
+	if(res == -1) {
+		if(errno == EAGAIN || errno == EWOULDBLOCK) return; // no data left
+		perror("handle_s2c(): Could not read");
+		close_client(cid);
+		return;
+	}
+
+	// data was received successfully
+	clients[cid].s2cbuf.len += res;
+
+	drain_s2c(cid);
 }
 
-void *accept_connections() {
-	puts("Waiting for connections");
-	while(1) {
-		int c = sizeof(struct sockaddr_in);
-		struct sockaddr_in client;
-		// TODO read man accept - why is &c needed?
-		int new_socket = accept(listen_sock_fd, (struct sockaddr *)&client, (socklen_t*)&c);
-		if(new_socket < 0) {
-			perror("accept failed");
-			continue;
-		}
-
-		fcntl(new_socket, F_SETFL, O_NONBLOCK);
-
-		pthread_mutex_lock(&clients_mutex);
-
-		int cid = init_client(new_socket);
-		printf("Adding client: %d (fd=%d)\n", cid, new_socket);
-		if(cid < 0) {
-			close(new_socket);
-			client_count --;
-		} else {
-			struct epoll_event event;
-			event.events = EPOLLIN;
-			event.data.fd = new_socket;
-			if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_socket, &event)) {
-				perror("epoll_ctl failed");
-				close_client(cid);
-			}
-		}
-
-		pthread_mutex_unlock(&clients_mutex);
+void accept_connection(int listen_sock_fd) {
+	int c = sizeof(struct sockaddr_in);
+	struct sockaddr_in client;
+	// TODO read man accept - why is &c needed?
+	int new_socket = accept(listen_sock_fd, (struct sockaddr *)&client, (socklen_t*)&c);
+	if(new_socket < 0) {
+		perror("accept_connection: accept() failed");
+		return;
 	}
+
+	if(fcntl(new_socket, F_SETFL, O_NONBLOCK) == -1) {
+		perror("accept_connection: failed to add O_NONBLOCK to socket with fcntl");
+		close(new_socket);
+		return;
+	}
+
+	int cid = init_client(new_socket);
+	if(cid < 0) {
+		close(new_socket);
+		return;
+	}
+	printf("Added client: %d (fd=%d)\n", cid, new_socket);
 }
 
 int get_client_id_by_clientfd(int sockfd) {
@@ -422,12 +389,8 @@ int get_client_id_by_serverfd(int sockfd) {
 
 int main(int argc , char *argv[])
 {
-	listen_sock_fd = start_listening(25565);
-	if(listen_sock_fd < 0) {
-		return 1;
-	}
-
-	listen(listen_sock_fd, 5);
+	int listen_sock_fd = start_listening(25565);
+	if(listen_sock_fd < 0) return 1;
 
 	epoll_fd = epoll_create1(0);
 	if(epoll_fd < 0) {
@@ -435,11 +398,12 @@ int main(int argc , char *argv[])
 		return 1;
 	}
 
-	pthread_t acc_thread;
-	if(pthread_create(&acc_thread, NULL, accept_connections, NULL)) {
-		perror("Failed to start listener thread");
-		return 1;
-	}
+	struct epoll_event ev;
+	ev.data.fd = listen_sock_fd;
+	ev.events = EPOLLIN;
+	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_sock_fd, &ev);
+
+	printf("EPOLLIN=%d, EPOLLOUT=%d\n", EPOLLIN, EPOLLOUT);
 
 	const int MAX_EVENTS = 10;
 	struct epoll_event events[MAX_EVENTS];
@@ -447,36 +411,46 @@ int main(int argc , char *argv[])
 		int event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 		if(event_count < 0) {
 			perror("epoll_wait failed");
-			return 2;
+			continue;
 		}
 
-		pthread_mutex_lock(&clients_mutex);
 		for(int i = 0;i < event_count;i ++) {
+			//printf("============== NEW EPOLL EVENT fd=%d, flags=%d ================\n", events[i].data.fd, events[i].events);
 			int fd = events[i].data.fd;
-			//puts("============== NEW EPOLL EVENT ================");
+			if(fd == listen_sock_fd) {
+				accept_connection(listen_sock_fd);
+				continue;
+			}
+
 			int client_id;
 
 			client_id = get_client_id_by_clientfd(fd);
 			if(client_id != -1) {
-				printf("handle_c2s(%d)\n", client_id);
-				handle_c2s(client_id);
+				if(events[i].events & EPOLLIN) {
+					handle_c2s(client_id);
+				}
+				if(events[i].events & EPOLLOUT) {
+					drain_s2c(client_id);
+				}
+				//printf("SEVERE: Got unknown epoll event(%d) for fd=%d, client_id=%d\n", events[i].events, fd, client_id);
 				continue;
 			}
 
 			client_id = get_client_id_by_serverfd(fd);
 			if(client_id != -1) {
-				//printf("handle_s2c(%d)\n", client_id);
-				handle_s2c(client_id);
+				if(events[i].events & EPOLLIN) {
+					handle_s2c(client_id);
+				}
+				if(events[i].events & EPOLLOUT) {
+					drain_c2s(client_id);
+				}
+				//printf("SEVERE: Got unknown epoll event(%d) for fd=%d, client_id=%d\n", events[i].events, fd, client_id);
 				continue;
 			}
 
 			printf("CRITICAL: Received event for fd that could not be found in clients\n");
-			//printf("Got event for fd: %d\n", fd);
 		}
-		pthread_mutex_unlock(&clients_mutex);
 	}
-
-	puts("WTF");
 
 	return 0;
 }
