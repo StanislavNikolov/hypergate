@@ -13,6 +13,7 @@
 #include <pthread.h>
 
 #include "minecraft.h"
+#include "log/src/log.h"
 
 int epoll_fd;
 
@@ -125,13 +126,15 @@ int drain(int fd, struct buffer *buf) {
 	// TODO write in a while() until no data left or EAGAIN for better performance?
 
 	if(buf->len == 0) {
-		printf("BUG?: drain() got an empty buffer\n");
+		log_debug("BUG?: drain() got an empty buffer");
 		mod_epoll(fd, EPOLLIN);
 		return 0;
 	}
+	if(buf->len == MAX_BUF_SIZE) {
+		log_debug("fd=%d buffer is full. Consider upping MAX_BUF_SIZE=%ld", fd, MAX_BUF_SIZE);
+	}
 
 	int res = send(fd, buf->data, buf->len, MSG_NOSIGNAL);
-	//printf("drain: res=%d\n", res);
 
 	if(res == -1) {
 		if(errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -158,13 +161,19 @@ int drain(int fd, struct buffer *buf) {
 }
 
 void drain_c2s(int cid) {
+	log_trace("drain_s2c(%d)", cid);
+
 	if(drain(clients[cid].server_fd, &clients[cid].c2sbuf) < 0) {
+		log_trace("drain() failed, closing client");
 		close_client(cid);
 	}
 }
 
 void drain_s2c(int cid) {
+	log_trace("drain_s2c(%d)", cid);
+
 	if(drain(clients[cid].client_fd, &clients[cid].s2cbuf) < 0) {
+		log_trace("drain() failed, closing client");
 		close_client(cid);
 	}
 }
@@ -184,12 +193,12 @@ void handshake(int cid) {
 	struct mcpacket_hdr hdr = parse_hdr(clients[cid].c2sbuf.data, clients[cid].c2sbuf.len, &bytes_used);
 
 	if(bytes_used < 0) { // critical error
-		printf("parse_hdr reported critical error! Closing client\n");
+		log_warn("parse_hdr reported critical error! Closing client");
 		close_client(cid);
 		return;
 	}
 	if(bytes_used == 0) { // need more data
-		puts("parse_hdr needs more data");
+		log_trace("parse_hdr needs more data");
 		return;
 	}
 	//printf(" pid=%d payloadlen=%ld bytes_used=%d\n", hdr.packetid, hdr.payloadlen, bytes_used);
@@ -203,7 +212,7 @@ void handshake(int cid) {
 	*/
 
 	if(hdr.packetid != 0x00) {
-		printf("hdr.packetid should've been 0x00. Closing client\n");
+		log_warn("hdr.packetid should've been 0x00. Closing client");
 		free(hdr.payload);
 		close_client(cid);
 		return;
@@ -214,19 +223,20 @@ void handshake(int cid) {
 	free(hdr.payload);
 
 	if(status < 0) {
-		printf("parse_handshake reported critical error! Closing client\n");
+		log_warn("parse_handshake reported critical error! Closing client");
 		close_client(cid);
 		return;
 	}
 
-	printf("NEW FORWARD: ver=%d, next_state=%d, hostname=",
-			packet.protocol_version, packet.next_state);
+	log_info("NEW FORWARD: ver=%d, next_state=%d", packet.protocol_version, packet.next_state);
+
+	printf("hostname=");
 	for(int i = 0;i < packet.server_address_len;i ++) {
 		printf("%c", packet.server_address[i]);
 	}
 	printf("\n");
 
-	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	int server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	if(server_fd < 0) {
 		perror("Could not create new socket to forward data to. Closing client");
 		close_client(cid);
@@ -236,13 +246,6 @@ void handshake(int cid) {
 
 	clients[cid].state = FORWARD;
 	clients[cid].server_fd = server_fd;
-
-	if(fcntl(server_fd, F_SETFL, O_NONBLOCK) < 0) {
-		perror("Could not set O_NONBLOCK to server_fd socket");
-		close_client(cid);
-		free(packet.server_address);
-		return;
-	}
 
 	struct sockaddr_in server;
 	server.sin_addr.s_addr = inet_addr("127.0.0.1");
@@ -268,28 +271,23 @@ void handshake(int cid) {
 	drain_c2s(cid);
 }
 
+void debug(int cid) {
+	printf("debug(%d)\n", cid);
+	printf(" state=%d\n", clients[cid].state);
+	printf(" c2sbuf.len=%ld\n", clients[cid].c2sbuf.len);
+	printf(" s2cbuf.len=%ld\n", clients[cid].s2cbuf.len);
+}
+
+
 void handle_c2s(int cid) {
-	//printf("handle_c2s(%d)\n", cid);
+	log_trace("cid = %d", cid);
+
 	int res = recv(clients[cid].client_fd,
 			clients[cid].c2sbuf.data + clients[cid].c2sbuf.len,
 			MAX_BUF_SIZE - clients[cid].c2sbuf.len, 0);
 
 	if(res == 0) { // socket closed?
-		int error = 0;
-		socklen_t len = sizeof(error);
-
-		if(getsockopt(clients[cid].server_fd, SOL_SOCKET, SO_ERROR, &error, &len)) {
-			perror("handle_c2s: getsockopt failed:");
-			close_client(cid);
-			return;
-		}
-
-		// TODO why are we getting res=0 if the socket is not closed?
-		if(error == 0) { // ok, socket was not closed, for some reason we had 0 bytes to read
-			return;
-		}
-
-		printf("handle_c2s: closing client %d with sockfd %d!\n", cid, clients[cid].client_fd);
+		log_debug("closing client %d with sockfd %d!", cid, clients[cid].client_fd);
 		close_client(cid);
 		return;
 	}
@@ -304,6 +302,7 @@ void handle_c2s(int cid) {
 	// data was received successfully
 	clients[cid].c2sbuf.len += res;
 
+	//debug(cid);
 	if(clients[cid].state == FORWARD) {
 		drain_c2s(cid);
 	} else {
@@ -312,26 +311,14 @@ void handle_c2s(int cid) {
 }
 
 void handle_s2c(int cid) {
+	log_trace("handle_s2c(%d)", cid);
+
 	int res = recv(clients[cid].server_fd,
 			clients[cid].s2cbuf.data + clients[cid].s2cbuf.len,
 			MAX_BUF_SIZE - clients[cid].s2cbuf.len, 0);
 
 	if(res == 0) { // socket closed?
-		int error = 0;
-		socklen_t len = sizeof(error);
-
-		if(getsockopt(clients[cid].server_fd, SOL_SOCKET, SO_ERROR, &error, &len)) {
-			perror("handle_s2c: getsockopt failed:");
-			close_client(cid);
-			return;
-		}
-
-		// TODO why are we getting res=0 if the socket is not closed?
-		if(error == 0) { // ok, socket was not closed, for some reason we had 0 bytes to read
-			return;
-		}
-
-		printf("handle_s2c: closing client %d with sockfd %d!\n", cid, clients[cid].client_fd);
+		log_debug("closing client %d with sockfd %d!", cid, clients[cid].client_fd);
 		close_client(cid);
 		return;
 	}
@@ -346,6 +333,7 @@ void handle_s2c(int cid) {
 	// data was received successfully
 	clients[cid].s2cbuf.len += res;
 
+	//debug(cid);
 	drain_s2c(cid);
 }
 
@@ -370,7 +358,7 @@ void accept_connection(int listen_sock_fd) {
 		close(new_socket);
 		return;
 	}
-	printf("Added client: %d (fd=%d)\n", cid, new_socket);
+	log_debug("Added client: cid=%d fd=%d", cid, new_socket);
 }
 
 int get_client_id_by_clientfd(int sockfd) {
@@ -403,9 +391,10 @@ int main(int argc , char *argv[])
 	ev.events = EPOLLIN;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_sock_fd, &ev);
 
-	printf("EPOLLIN=%d, EPOLLOUT=%d\n", EPOLLIN, EPOLLOUT);
+	log_set_level(LOG_DEBUG);
+	log_info("Hypergate started");
 
-	const int MAX_EVENTS = 10;
+	const int MAX_EVENTS = 9;
 	struct epoll_event events[MAX_EVENTS];
 	while(1) {
 		int event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -415,7 +404,7 @@ int main(int argc , char *argv[])
 		}
 
 		for(int i = 0;i < event_count;i ++) {
-			//printf("============== NEW EPOLL EVENT fd=%d, flags=%d ================\n", events[i].data.fd, events[i].events);
+			log_trace("============== NEW EPOLL EVENT fd=%d, flags=%d ================", events[i].data.fd, events[i].events);
 			int fd = events[i].data.fd;
 			if(fd == listen_sock_fd) {
 				accept_connection(listen_sock_fd);
@@ -426,29 +415,29 @@ int main(int argc , char *argv[])
 
 			client_id = get_client_id_by_clientfd(fd);
 			if(client_id != -1) {
+				//debug(client_id);
 				if(events[i].events & EPOLLIN) {
 					handle_c2s(client_id);
 				}
 				if(events[i].events & EPOLLOUT) {
 					drain_s2c(client_id);
 				}
-				//printf("SEVERE: Got unknown epoll event(%d) for fd=%d, client_id=%d\n", events[i].events, fd, client_id);
 				continue;
 			}
 
 			client_id = get_client_id_by_serverfd(fd);
 			if(client_id != -1) {
+				//debug(client_id);
 				if(events[i].events & EPOLLIN) {
 					handle_s2c(client_id);
 				}
 				if(events[i].events & EPOLLOUT) {
 					drain_c2s(client_id);
 				}
-				//printf("SEVERE: Got unknown epoll event(%d) for fd=%d, client_id=%d\n", events[i].events, fd, client_id);
 				continue;
 			}
 
-			printf("CRITICAL: Received event for fd that could not be found in clients\n");
+			log_warn("Received event for fd that could not be found in clients");
 		}
 	}
 
