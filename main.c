@@ -19,7 +19,7 @@ int epoll_fd;
 
 enum client_state {HANDSHAKE, FORWARD};
 
-const size_t MAX_BUF_SIZE = 10240;
+const size_t MAX_BUF_SIZE = 2048;
 struct buffer {
 	unsigned char *data;
 	size_t len;
@@ -38,7 +38,7 @@ int client_count = 0;
 struct VHost {
 	char *name;
 	int port;
-} vhosts[2] = {{"192.168.8.103", 2001}, {"s2", 2002}};
+} vhosts[2] = {{"s1.samouchiteli.in", 2001}, {"s2.samouchiteli.in", 2002}};
 
 void mod_epoll(int fd, int events) {
 	struct epoll_event ev;
@@ -128,41 +128,36 @@ int start_listening(int port) {
 }
 
 int drain(int fd, struct buffer *buf) {
-	// TODO write in a while() until no data left or EAGAIN for better performance?
-
 	if(buf->len == 0) {
 		log_debug("BUG?: drain() got an empty buffer");
 		mod_epoll(fd, EPOLLIN);
 		return 0;
 	}
-	if(buf->len == MAX_BUF_SIZE) {
-		log_debug("fd=%d buffer is full. Consider upping MAX_BUF_SIZE=%ld", fd, MAX_BUF_SIZE);
-	}
 
-	int res = send(fd, buf->data, buf->len, MSG_NOSIGNAL);
+	while(1) {
+		int res = send(fd, buf->data, buf->len, MSG_NOSIGNAL);
 
-	if(res == -1) {
-		if(errno == EAGAIN || errno == EWOULDBLOCK) {
+		if(res == -1) {
+			if(errno == EAGAIN || errno == EWOULDBLOCK) {
+				mod_epoll(fd, EPOLLIN | EPOLLOUT);
+				return 0;
+			}
+			return -1;
+		}
+
+		if(res == 0) {
 			mod_epoll(fd, EPOLLIN | EPOLLOUT);
 			return 0;
 		}
-		return -1;
-	}
 
-	buf->len -= res;
-	if(buf->len == 0) {
-		mod_epoll(fd, EPOLLIN);
-		return 0;
-	}
+		buf->len -= res;
+		if(buf->len == 0) {
+			mod_epoll(fd, EPOLLIN);
+			return 0;
+		}
 
-	if(res == 0) {
-		mod_epoll(fd, EPOLLIN | EPOLLOUT);
-		return 0;
+		memcpy(buf->data, buf->data + res, buf->len);
 	}
-
-	mod_epoll(fd, EPOLLIN | EPOLLOUT);
-	memcpy(buf->data, buf->data + res, buf->len);
-	return 0;
 }
 
 void drain_c2s(int cid) {
@@ -295,12 +290,17 @@ void debug(int cid) {
 void handle_c2s(int cid) {
 	log_trace("cid = %d", cid);
 
+	if(clients[cid].c2sbuf.len == MAX_BUF_SIZE) {
+		log_debug("c2s buffer is full. Consider upping MAX_BUF_SIZE=%ld", MAX_BUF_SIZE);
+		goto end;
+	}
+
 	int res = recv(clients[cid].client_fd,
 			clients[cid].c2sbuf.data + clients[cid].c2sbuf.len,
 			MAX_BUF_SIZE - clients[cid].c2sbuf.len, 0);
 
 	if(res == 0) { // socket closed?
-		log_debug("closing client %d with sockfd %d!", cid, clients[cid].client_fd);
+		log_debug("Client socket closed. Closing client %d with sockfd %d!", cid, clients[cid].client_fd);
 		close_client(cid);
 		return;
 	}
@@ -315,7 +315,7 @@ void handle_c2s(int cid) {
 	// data was received successfully
 	clients[cid].c2sbuf.len += res;
 
-	//debug(cid);
+end:
 	if(clients[cid].state == FORWARD) {
 		drain_c2s(cid);
 	} else {
@@ -326,12 +326,17 @@ void handle_c2s(int cid) {
 void handle_s2c(int cid) {
 	log_trace("handle_s2c(%d)", cid);
 
+	if(clients[cid].s2cbuf.len == MAX_BUF_SIZE) {
+		log_debug("s2c buffer is full. Consider upping MAX_BUF_SIZE=%ld", MAX_BUF_SIZE);
+		goto end;
+	}
+
 	int res = recv(clients[cid].server_fd,
 			clients[cid].s2cbuf.data + clients[cid].s2cbuf.len,
 			MAX_BUF_SIZE - clients[cid].s2cbuf.len, 0);
 
 	if(res == 0) { // socket closed?
-		log_debug("closing client %d with sockfd %d!", cid, clients[cid].client_fd);
+		log_debug("Server socket closed. Closing client %d with sockfd %d!", cid, clients[cid].client_fd);
 		close_client(cid);
 		return;
 	}
@@ -346,7 +351,7 @@ void handle_s2c(int cid) {
 	// data was received successfully
 	clients[cid].s2cbuf.len += res;
 
-	//debug(cid);
+end:
 	drain_s2c(cid);
 }
 
@@ -390,6 +395,14 @@ int get_client_id_by_serverfd(int sockfd) {
 
 int main(int argc , char *argv[])
 {
+	log_set_level(LOG_INFO);
+	for(int i = 1;i < argc;i ++) {
+		if(strcmp("-v",  argv[i]) == 0) log_set_level(LOG_DEBUG);
+		if(strcmp("-vv", argv[i]) == 0) log_set_level(LOG_TRACE);
+	}
+	log_trace("Traces are shown");
+	log_debug("Debugs are shown");
+
 	int listen_sock_fd = start_listening(25565);
 	if(listen_sock_fd < 0) return 1;
 
@@ -404,7 +417,6 @@ int main(int argc , char *argv[])
 	ev.events = EPOLLIN;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_sock_fd, &ev);
 
-	log_set_level(LOG_INFO);
 	log_info("Hypergate started");
 
 	const int MAX_EVENTS = 9;
