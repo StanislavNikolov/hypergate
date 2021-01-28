@@ -38,7 +38,7 @@ int client_count = 0;
 struct VHost {
 	char *name;
 	int port;
-} vhosts[2] = {{"s1.samouchiteli.in", 2001}, {"s2.samouchiteli.in", 2002}};
+} vhosts[] = {{"s1.samouchiteli.in", 2001}, {"s2.samouchiteli.in", 2002}, {"s2", 2001}};
 
 void mod_epoll(int fd, int events) {
 	struct epoll_event ev;
@@ -102,11 +102,12 @@ int start_listening(int port) {
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd == -1) {
 		perror("Could not create socket");
-		return 1;
+		return -1;
 	}
 
-	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0) {
+	if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0) {
 		perror("setsockopt(SO_REUSEADDR) failed");
+		return -1;
 	}
 
 	struct sockaddr_in server;
@@ -121,15 +122,40 @@ int start_listening(int port) {
 
 	if(listen(sockfd, 5) == -1) {
 		perror("listen failed");
-		return 1;
+		return -1;
 	}
 
 	return sockfd;
 }
 
+void accept_connection(int listen_sock_fd) {
+	int c = sizeof(struct sockaddr_in);
+	struct sockaddr_in client;
+	// TODO read man accept - why is &c needed?
+	int new_socket = accept(listen_sock_fd, (struct sockaddr *)&client, (socklen_t*)&c);
+	if(new_socket < 0) {
+		perror("accept_connection: accept() failed");
+		return;
+	}
+
+	if(fcntl(new_socket, F_SETFL, O_NONBLOCK) == -1) {
+		perror("accept_connection: failed to add O_NONBLOCK to socket with fcntl");
+		close(new_socket);
+		return;
+	}
+
+	int cid = init_client(new_socket);
+	if(cid < 0) {
+		close(new_socket);
+		return;
+	}
+	log_debug("Added client: cid=%d fd=%d", cid, new_socket);
+}
+
+
 int drain(int fd, struct buffer *buf) {
 	if(buf->len == 0) {
-		log_debug("BUG?: drain() got an empty buffer");
+		log_info("BUG?: drain() got an empty buffer");
 		mod_epoll(fd, EPOLLIN);
 		return 0;
 	}
@@ -160,50 +186,27 @@ int drain(int fd, struct buffer *buf) {
 	}
 }
 
-void drain_c2s(int cid) {
-	log_trace("drain_s2c(%d)", cid);
+/* Return value:
+ *   -2 - failed handshake - the called should close the client
+ *   -1 - not enough data - call handshake again when the clints's c2s buffer has more data
+ * >= 0 - handshake done - stop calling handshake. Returning proper server fd
+ */
 
-	if(drain(clients[cid].server_fd, &clients[cid].c2sbuf) < 0) {
-		log_trace("drain() failed, closing client");
-		close_client(cid);
-	}
-}
-
-void drain_s2c(int cid) {
-	log_trace("drain_s2c(%d)", cid);
-
-	if(drain(clients[cid].client_fd, &clients[cid].s2cbuf) < 0) {
-		log_trace("drain() failed, closing client");
-		close_client(cid);
-	}
-}
-
-void handshake(int cid) {
-	//printf("handshake(%d)\n", cid);
-
-	/*
-	printf("Current bytes (%ld):\n", clients[cid].c2sbuf.len);
-	for(size_t i = 0;i < clients[cid].c2sbuf.len;i ++) {
-		printf("%.02x ", clients[cid].c2sbuf.data[i]);
-	}
-	puts("");
-	*/
-
+int handshake(int cid) {
 	int bytes_used;
 	struct mcpacket_hdr hdr = parse_hdr(clients[cid].c2sbuf.data, clients[cid].c2sbuf.len, &bytes_used);
 
 	if(bytes_used < 0) { // critical error
-		log_warn("parse_hdr reported critical error! Closing client");
-		close_client(cid);
-		return;
+		log_warn("parse_hdr reported critical error!");
+		return -2;
 	}
 	if(bytes_used == 0) { // need more data
 		log_trace("parse_hdr needs more data");
-		return;
+		return -1;
 	}
-	//printf(" pid=%d payloadlen=%ld bytes_used=%d\n", hdr.packetid, hdr.payloadlen, bytes_used);
 
 	/*
+	printf(" pid=%d payloadlen=%ld bytes_used=%d\n", hdr.packetid, hdr.payloadlen, bytes_used);
 	printf(" payload=");
 	for(size_t i = 0;i < packet.payloadlen;i ++) {
 		printf("%.02x ", packet.payload[i]);
@@ -212,10 +215,9 @@ void handshake(int cid) {
 	*/
 
 	if(hdr.packetid != 0x00) {
-		log_warn("hdr.packetid should've been 0x00. Closing client");
+		log_warn("hdr.packetid should've been 0x00.");
 		free(hdr.payload);
-		close_client(cid);
-		return;
+		return -2;
 	}
 
 	char status = 0;
@@ -223,12 +225,12 @@ void handshake(int cid) {
 	free(hdr.payload);
 
 	if(status < 0) {
-		log_warn("parse_handshake reported critical error! Closing client");
-		close_client(cid);
-		return;
+		log_warn("parse_handshake reported critical error!");
+		free(packet.server_address);
+		return -2;
 	}
 
-	log_info("New forward request: hostname=%s, ver=%d, next_state=%d",
+	log_debug("New forward request: hostname=%s, ver=%d, next_state=%d",
 			packet.server_address, packet.protocol_version, packet.next_state);
 
 	int port = -1;
@@ -241,20 +243,15 @@ void handshake(int cid) {
 	free(packet.server_address);
 
 	if(port == -1) {
-		log_warn("Unknown vhost. Closing client");
-		close_client(cid);
-		return;
+		log_warn("Unknown vhost %s", packet.server_address);
+		return -2;
 	}
 
 	int server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	if(server_fd < 0) {
-		perror("Could not create new socket to forward data to. Closing client");
-		close_client(cid);
-		return;
+		perror("Could not create new socket to forward data to");
+		return -2;
 	}
-
-	clients[cid].state = FORWARD;
-	clients[cid].server_fd = server_fd;
 
 	struct sockaddr_in server;
 	server.sin_addr.s_addr = inet_addr("127.0.0.1");
@@ -262,9 +259,9 @@ void handshake(int cid) {
 	server.sin_port = htons(port);
 
 	if(connect(server_fd, (struct sockaddr *)&server, sizeof(server)) < 0 && errno != EINPROGRESS) {
-		perror("Could not connect socket to server. Closing client");
-		close_client(cid);
-		return;
+		perror("Could not connect socket to server");
+		close(server_fd);
+		return -2;
 	}
 
 	struct epoll_event ev;
@@ -272,11 +269,11 @@ void handshake(int cid) {
 	ev.events = EPOLLIN;
 	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev)) {
 		perror("handshake: epoll_ctl failed");
-		close_client(cid);
-		return;
+		close(server_fd);
+		return -2;
 	}
 
-	drain_c2s(cid);
+	return server_fd;
 }
 
 void debug(int cid) {
@@ -286,97 +283,78 @@ void debug(int cid) {
 	printf(" s2cbuf.len=%ld\n", clients[cid].s2cbuf.len);
 }
 
-
-void handle_c2s(int cid) {
-	log_trace("cid = %d", cid);
-
-	if(clients[cid].c2sbuf.len == MAX_BUF_SIZE) {
-		log_debug("c2s buffer is full. Consider upping MAX_BUF_SIZE=%ld", MAX_BUF_SIZE);
-		goto end;
+int bufread(int fd, struct buffer *buf) {
+	// TODO do it in while?
+	if(buf->len == MAX_BUF_SIZE) {
+		log_trace("buffer is full. Consider upping MAX_BUF_SIZE=%ld", MAX_BUF_SIZE);
+		return 0;
 	}
 
-	int res = recv(clients[cid].client_fd,
-			clients[cid].c2sbuf.data + clients[cid].c2sbuf.len,
-			MAX_BUF_SIZE - clients[cid].c2sbuf.len, 0);
+	int res = recv(fd, buf->data + buf->len, MAX_BUF_SIZE - buf->len, 0);
 
-	if(res == 0) { // socket closed?
-		log_debug("Client socket closed. Closing client %d with sockfd %d!", cid, clients[cid].client_fd);
-		close_client(cid);
-		return;
+	if(res == 0) {
+		log_trace("socket(fd=%d) closed", fd);
+		return -1;
 	}
 
 	if(res == -1) {
-		if(errno == EAGAIN || errno == EWOULDBLOCK) return; // no data left
-		perror("handle_c2s(): Could not read");
-		close_client(cid);
-		return;
+		if(errno == EAGAIN || errno == EWOULDBLOCK) return 0; // no data left
+		log_trace("bufread recv failed: %s", strerror(errno));
+		return -1;
 	}
 
 	// data was received successfully
-	clients[cid].c2sbuf.len += res;
-
-end:
-	if(clients[cid].state == FORWARD) {
-		drain_c2s(cid);
-	} else {
-		handshake(cid);
-	}
+	buf->len += res;
+	return 0;
 }
 
-void handle_s2c(int cid) {
+int handle_c2s(int cid) {
+	log_trace("handle_c2s(%d)", cid);
+
+	if(bufread(clients[cid].client_fd, &clients[cid].c2sbuf) < 0) {
+		log_debug("bufread() failed");
+		return -1;
+	}
+
+	if(clients[cid].state == FORWARD) {
+		if(drain(clients[cid].server_fd, &clients[cid].c2sbuf) < 0) {
+			log_debug("drain() failed");
+			return -1;
+		}
+	} else {
+		int server_fd = handshake(cid);
+		if(server_fd == -2) {
+			log_warn("Handshake failed. Closing client");
+			return -1;
+		}
+		if(server_fd == -1) return 0; // more data neeeded
+
+		clients[cid].state = FORWARD;
+		clients[cid].server_fd = server_fd;
+
+		if(drain(clients[cid].server_fd, &clients[cid].c2sbuf) < 0) {
+			log_debug("Weird... drain() failed just after finishing handshake");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+int handle_s2c(int cid) {
 	log_trace("handle_s2c(%d)", cid);
 
-	if(clients[cid].s2cbuf.len == MAX_BUF_SIZE) {
-		log_debug("s2c buffer is full. Consider upping MAX_BUF_SIZE=%ld", MAX_BUF_SIZE);
-		goto end;
+	if(bufread(clients[cid].server_fd, &clients[cid].s2cbuf) < 0) {
+		log_debug("bufread() failed");
+		return -1;
 	}
 
-	int res = recv(clients[cid].server_fd,
-			clients[cid].s2cbuf.data + clients[cid].s2cbuf.len,
-			MAX_BUF_SIZE - clients[cid].s2cbuf.len, 0);
-
-	if(res == 0) { // socket closed?
-		log_debug("Server socket closed. Closing client %d with sockfd %d!", cid, clients[cid].client_fd);
-		close_client(cid);
-		return;
+	if(drain(clients[cid].client_fd, &clients[cid].s2cbuf) < 0) {
+		log_trace("drain() failed");
+		return -1;
 	}
 
-	if(res == -1) {
-		if(errno == EAGAIN || errno == EWOULDBLOCK) return; // no data left
-		perror("handle_s2c(): Could not read");
-		close_client(cid);
-		return;
-	}
-
-	// data was received successfully
-	clients[cid].s2cbuf.len += res;
-
-end:
-	drain_s2c(cid);
-}
-
-void accept_connection(int listen_sock_fd) {
-	int c = sizeof(struct sockaddr_in);
-	struct sockaddr_in client;
-	// TODO read man accept - why is &c needed?
-	int new_socket = accept(listen_sock_fd, (struct sockaddr *)&client, (socklen_t*)&c);
-	if(new_socket < 0) {
-		perror("accept_connection: accept() failed");
-		return;
-	}
-
-	if(fcntl(new_socket, F_SETFL, O_NONBLOCK) == -1) {
-		perror("accept_connection: failed to add O_NONBLOCK to socket with fcntl");
-		close(new_socket);
-		return;
-	}
-
-	int cid = init_client(new_socket);
-	if(cid < 0) {
-		close(new_socket);
-		return;
-	}
-	log_debug("Added client: cid=%d fd=%d", cid, new_socket);
+	return 0;
 }
 
 int get_client_id_by_clientfd(int sockfd) {
@@ -419,7 +397,7 @@ int main(int argc , char *argv[])
 
 	log_info("Hypergate started");
 
-	const int MAX_EVENTS = 9;
+	const int MAX_EVENTS = 20;
 	struct epoll_event events[MAX_EVENTS];
 	while(1) {
 		int event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -427,6 +405,8 @@ int main(int argc , char *argv[])
 			perror("epoll_wait failed");
 			continue;
 		}
+
+		log_trace("epoll_wait returned %d events", event_count);
 
 		for(int i = 0;i < event_count;i ++) {
 			log_trace("============== NEW EPOLL EVENT fd=%d, flags=%d ================", events[i].data.fd, events[i].events);
@@ -440,24 +420,38 @@ int main(int argc , char *argv[])
 
 			client_id = get_client_id_by_clientfd(fd);
 			if(client_id != -1) {
-				//debug(client_id);
 				if(events[i].events & EPOLLIN) {
-					handle_c2s(client_id);
+					if(handle_c2s(client_id) < 0) {
+						log_info("Closing client");
+						close_client(client_id);
+						continue;
+					}
 				}
 				if(events[i].events & EPOLLOUT) {
-					drain_s2c(client_id);
+					if(drain(clients[client_id].client_fd, &clients[client_id].s2cbuf)) {
+						log_info("Closing client");
+						close_client(client_id);
+						continue;
+					}
 				}
 				continue;
 			}
 
 			client_id = get_client_id_by_serverfd(fd);
 			if(client_id != -1) {
-				//debug(client_id);
 				if(events[i].events & EPOLLIN) {
-					handle_s2c(client_id);
+					if(handle_s2c(client_id) < 0) {
+						log_info("Closing client");
+						close_client(client_id);
+						continue;
+					}
 				}
 				if(events[i].events & EPOLLOUT) {
-					drain_c2s(client_id);
+					if(drain(clients[client_id].server_fd, &clients[client_id].c2sbuf) < 0) {
+						log_info("Closing client");
+						close_client(client_id);
+						continue;
+					}
 				}
 				continue;
 			}
