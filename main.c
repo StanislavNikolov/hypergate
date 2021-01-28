@@ -333,7 +333,7 @@ int handle_c2s(int cid) {
 		clients[cid].server_fd = server_fd;
 
 		if(drain(clients[cid].server_fd, &clients[cid].c2sbuf) < 0) {
-			log_debug("Weird... drain() failed just after finishing handshake");
+			log_debug("drain() failed");
 			return -1;
 		}
 	}
@@ -369,6 +369,15 @@ int get_client_id_by_serverfd(int sockfd) {
 		if(clients[i].server_fd == sockfd) return i;
 	}
 	return -1;
+}
+
+void invalidate_events(int cid, struct epoll_event *events, int events_count) {
+	for(int i = 0;i < events_count;i ++) {
+		if(events[i].data.fd == clients[cid].client_fd
+		|| (clients[cid].state == FORWARD && events[i].data.fd == clients[cid].server_fd)) {
+			events[i].data.fd = -1;
+		}
+	}
 }
 
 int main(int argc , char *argv[])
@@ -411,6 +420,11 @@ int main(int argc , char *argv[])
 		for(int i = 0;i < event_count;i ++) {
 			log_trace("============== NEW EPOLL EVENT fd=%d, flags=%d ================", events[i].data.fd, events[i].events);
 			int fd = events[i].data.fd;
+
+			if(fd == -1) { // invalidated event
+				continue;
+			}
+
 			if(fd == listen_sock_fd) {
 				accept_connection(listen_sock_fd);
 				continue;
@@ -423,6 +437,7 @@ int main(int argc , char *argv[])
 				if(events[i].events & EPOLLIN) {
 					if(handle_c2s(client_id) < 0) {
 						log_info("Closing client");
+						invalidate_events(client_id, events, event_count);
 						close_client(client_id);
 						continue;
 					}
@@ -430,6 +445,7 @@ int main(int argc , char *argv[])
 				if(events[i].events & EPOLLOUT) {
 					if(drain(clients[client_id].client_fd, &clients[client_id].s2cbuf)) {
 						log_info("Closing client");
+						invalidate_events(client_id, events, event_count);
 						close_client(client_id);
 						continue;
 					}
@@ -442,6 +458,7 @@ int main(int argc , char *argv[])
 				if(events[i].events & EPOLLIN) {
 					if(handle_s2c(client_id) < 0) {
 						log_info("Closing client");
+						invalidate_events(client_id, events, event_count);
 						close_client(client_id);
 						continue;
 					}
@@ -449,6 +466,7 @@ int main(int argc , char *argv[])
 				if(events[i].events & EPOLLOUT) {
 					if(drain(clients[client_id].server_fd, &clients[client_id].c2sbuf) < 0) {
 						log_info("Closing client");
+						invalidate_events(client_id, events, event_count);
 						close_client(client_id);
 						continue;
 					}
@@ -456,7 +474,7 @@ int main(int argc , char *argv[])
 				continue;
 			}
 
-			log_warn("Received event for fd that could not be found in clients");
+			log_error("BUG! Received event for fd %d that could not be found in clients", fd);
 		}
 	}
 
