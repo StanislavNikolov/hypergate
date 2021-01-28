@@ -35,6 +35,11 @@ struct client {
 } clients[100];
 int client_count = 0;
 
+struct VHost {
+	char *name;
+	int port;
+} vhosts[2] = {{"192.168.8.103", 2001}, {"s2", 2002}};
+
 void mod_epoll(int fd, int events) {
 	struct epoll_event ev;
 	ev.data.fd = fd;
@@ -228,19 +233,28 @@ void handshake(int cid) {
 		return;
 	}
 
-	log_info("NEW FORWARD: ver=%d, next_state=%d", packet.protocol_version, packet.next_state);
+	log_info("New forward request: hostname=%s, ver=%d, next_state=%d",
+			packet.server_address, packet.protocol_version, packet.next_state);
 
-	printf("hostname=");
-	for(int i = 0;i < packet.server_address_len;i ++) {
-		printf("%c", packet.server_address[i]);
+	int port = -1;
+	for(int v = 0;v < sizeof(vhosts) / sizeof(struct VHost);v ++) {
+		if(strcmp(vhosts[v].name, packet.server_address) == 0) {
+			port = vhosts[v].port;
+			break;
+		}
 	}
-	printf("\n");
+	free(packet.server_address);
+
+	if(port == -1) {
+		log_warn("Unknown vhost. Closing client");
+		close_client(cid);
+		return;
+	}
 
 	int server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	if(server_fd < 0) {
 		perror("Could not create new socket to forward data to. Closing client");
 		close_client(cid);
-		free(packet.server_address);
 		return;
 	}
 
@@ -250,8 +264,7 @@ void handshake(int cid) {
 	struct sockaddr_in server;
 	server.sin_addr.s_addr = inet_addr("127.0.0.1");
 	server.sin_family = AF_INET;
-	server.sin_port = htons(2001);
-	free(packet.server_address);
+	server.sin_port = htons(port);
 
 	if(connect(server_fd, (struct sockaddr *)&server, sizeof(server)) < 0 && errno != EINPROGRESS) {
 		perror("Could not connect socket to server. Closing client");
@@ -391,7 +404,7 @@ int main(int argc , char *argv[])
 	ev.events = EPOLLIN;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_sock_fd, &ev);
 
-	log_set_level(LOG_DEBUG);
+	log_set_level(LOG_INFO);
 	log_info("Hypergate started");
 
 	const int MAX_EVENTS = 9;

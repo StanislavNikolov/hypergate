@@ -38,17 +38,21 @@ struct mcpacket_handshake parse_handshake(unsigned char *buf, size_t len, char *
 	head += used;
 
 
-	packet.server_address_len = read_VarInt(buf + head, len - head, &used);
+	//packet.server_address_len = read_VarInt(buf + head, len - head, &used);
+	int addr_len = read_VarInt(buf + head, len - head, &used);
 	if(used < 0) { *status = -1; return packet; }
 	head += used;
 
 
-	if(packet.server_address_len > 255*4+3)    { *status = -1; return packet; }
-	if(head + packet.server_address_len > len) { *status = -1; return packet; }
-	packet.server_address = malloc(packet.server_address_len);
-	if(packet.server_address == NULL)          { *status = -1; return packet; }
-	memcpy(packet.server_address, buf + head, packet.server_address_len);
-	head += packet.server_address_len;
+	if(addr_len > 255*4+3)    { *status = -1; return packet; }
+	if(head + addr_len > len) { *status = -1; return packet; }
+
+	packet.server_address = malloc(addr_len + 1);
+	if(packet.server_address == NULL) { *status = -1; return packet; }
+
+	memcpy(packet.server_address, buf + head, addr_len);
+	packet.server_address[addr_len] = '\0';
+	head += addr_len;
 
 
 	// server port - unsigned short, ignoring it

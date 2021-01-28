@@ -8,8 +8,8 @@ struct mcpacket_hdr {
 
 struct mcpacket_handshake {
 	int protocol_version;
-	int server_address_len;
-	unsigned char *server_address;
+	//int server_address_len;
+	char *server_address;
 	int server_port;
 	int next_state;
 };
